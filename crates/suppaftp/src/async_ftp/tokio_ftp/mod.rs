@@ -11,6 +11,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::string::String;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -25,6 +26,7 @@ pub use tls::{AsyncNoTlsStream, TokioTlsStream};
 pub use tls::{AsyncRustlsConnector, AsyncRustlsStream};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, copy};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::Semaphore;
 
 use super::super::Status;
 use super::super::regex::{EPSV_PORT_RE, MDTM_RE, SIZE_RE};
@@ -53,11 +55,7 @@ where
     welcome_msg: Option<String>,
     active_timeout: Duration,
     passive_stream_builder: Box<TokioPassiveStreamBuilder>,
-    /// flags whether a data connection is currently open
-    ///
-    /// Since it isn't possible to have multiple data connections at the same time,
-    /// this flag is used to track whether a data connection is currently open.
-    data_connection_open: bool,
+    data_connection_semaphore: Arc<Semaphore>,
     #[cfg(not(feature = "async-secure"))]
     marker: PhantomData<T>,
     #[cfg(feature = "async-secure")]
@@ -95,12 +93,12 @@ where
     pub async fn connect_with_stream(stream: TcpStream) -> FtpResult<Self> {
         debug!("Established connection with server");
         let mut ftp_stream = ImplAsyncFtpStream {
-            reader: BufReader::new(DataStream::Tcp(stream)),
+            reader: BufReader::new(DataStream::from_tcp(stream)),
             #[cfg(not(feature = "async-secure"))]
             marker: PhantomData {},
             mode: Mode::Passive,
             nat_workaround: false,
-            data_connection_open: false,
+            data_connection_semaphore: Arc::new(Semaphore::new(1)),
             passive_stream_builder: Self::default_passive_stream_builder(),
             welcome_msg: None,
             #[cfg(feature = "async-secure")]
@@ -154,11 +152,11 @@ where
             .await
             .map_err(|e| FtpError::SecureError(format!("{e}")))?;
         let mut secured_ftp_tream = ImplAsyncFtpStream {
-            reader: BufReader::new(DataStream::Ssl(Box::new(stream))),
+            reader: BufReader::new(DataStream::from_ssl(Box::new(stream))),
             mode: self.mode,
             nat_workaround: self.nat_workaround,
             passive_stream_builder: self.passive_stream_builder,
-            data_connection_open: self.data_connection_open,
+            data_connection_semaphore: self.data_connection_semaphore,
             tls_ctx: Some(Box::new(tls_connector)),
             domain: Some(String::from(domain)),
             welcome_msg: self.welcome_msg,
@@ -209,11 +207,11 @@ where
             .map(|stream| {
                 debug!("Established connection with server");
                 Self {
-                    reader: BufReader::new(DataStream::Tcp(stream)),
+                    reader: BufReader::new(DataStream::from_tcp(stream)),
                     mode: Mode::Passive,
                     nat_workaround: false,
                     welcome_msg: None,
-                    data_connection_open: false,
+                    data_connection_semaphore: Arc::new(Semaphore::new(1)),
                     passive_stream_builder: Self::default_passive_stream_builder(),
                     tls_ctx: None,
                     domain: None,
@@ -228,10 +226,10 @@ where
             .map_err(|e| FtpError::SecureError(format!("{e}")))?;
         debug!("TLS Steam OK");
         let mut stream = ImplAsyncFtpStream {
-            reader: BufReader::new(DataStream::Ssl(stream.into())),
+            reader: BufReader::new(DataStream::from_ssl(stream.into())),
             mode: Mode::Passive,
             nat_workaround: false,
-            data_connection_open: false,
+            data_connection_semaphore: Arc::new(Semaphore::new(1)),
             passive_stream_builder: Self::default_passive_stream_builder(),
             tls_ctx: Some(Box::new(tls_connector)),
             domain: Some(String::from(domain)),
@@ -323,7 +321,7 @@ where
         self.perform(Command::ClearCommandChannel).await?;
         self.read_response(Status::CommandOk).await?;
         trace!("CCC OK");
-        self.reader = BufReader::new(DataStream::Tcp(self.reader.into_inner().into_tcp_stream()));
+        self.reader = BufReader::new(DataStream::from_tcp(self.reader.into_inner().into_tcp_stream()));
         Ok(self)
     }
 
@@ -469,7 +467,6 @@ where
         debug!("Finalizing retr stream");
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         drop(stream);
-        self.data_connection_open = false;
         trace!("dropped stream");
         // Then read response
         self.read_response_in(&[Status::ClosingDataConnection, Status::RequestedFileActionOk])
@@ -541,7 +538,6 @@ where
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         stream.shutdown().await.map_err(FtpError::ConnectionError)?;
         drop(stream);
-        self.data_connection_open = false;
         trace!("Stream dropped");
         // Read response
         self.read_response_in(&[Status::ClosingDataConnection, Status::RequestedFileActionOk])
@@ -587,7 +583,6 @@ where
         self.perform(Command::Abor).await?;
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         drop(data_stream);
-        self.data_connection_open = false;
         trace!("dropped stream");
         let response = self
             .read_response_in(&[Status::ClosingDataConnection, Status::TransferAborted])
@@ -826,7 +821,6 @@ where
         debug!("closing data connection");
         // Drop stream NOTE: must be done first, otherwise server won't return any response
         drop(stream);
-        self.data_connection_open = false;
         trace!("dropped stream");
         // Then read response
         self.read_response_in(&[Status::ClosingDataConnection, Status::RequestedFileActionOk])
@@ -872,8 +866,11 @@ where
 
     /// Execute command which send data back in a separate stream
     async fn data_command(&mut self, cmd: Command) -> FtpResult<DataStream<T>> {
-        // guard data connection
-        self.guard_multiple_data_connections()?;
+        // Acquire permit; suspends until any active data connection is dropped
+        let permit = Arc::clone(&self.data_connection_semaphore)
+            .acquire_owned()
+            .await
+            .expect("data_connection_semaphore was unexpectedly closed");
 
         let stream = match self.mode {
             Mode::Active => {
@@ -907,22 +904,21 @@ where
         };
 
         #[cfg(not(feature = "async-secure"))]
-        let result = Ok(DataStream::Tcp(stream));
+        let result = Ok(DataStream::from_tcp(stream));
 
         #[cfg(feature = "async-secure")]
         let result = match self.tls_ctx {
             Some(ref tls_ctx) => tls_ctx
                 .connect(self.domain.as_ref().unwrap(), stream)
                 .await
-                .map(|x| DataStream::Ssl(Box::new(x)))
+                .map(|x| DataStream::from_ssl(Box::new(x)))
                 .map_err(|e| FtpError::SecureError(format!("{e}"))),
-            None => Ok(DataStream::Tcp(stream)),
+            None => Ok(DataStream::from_tcp(stream)),
         };
 
-        if result.is_ok() {
-            self.data_connection_open = true;
-        }
-        result
+        // On success, embed the permit (released via RAII when DataStream is dropped).
+        // On failure, permit drops here, immediately releasing the semaphore.
+        result.map(|s| s.with_permit(permit))
     }
 
     /// Runs the EPSV to enter Extended passive mode.
@@ -981,14 +977,13 @@ where
         let addr = conn.local_addr().map_err(FtpError::ConnectionError)?;
         trace!("Local address is {}", addr);
 
-        let ip = match self.reader.get_mut() {
-            DataStream::Tcp(stream) => stream.local_addr().map_err(FtpError::ConnectionError)?.ip(),
-            DataStream::Ssl(stream) => stream
-                .get_ref()
-                .local_addr()
-                .map_err(FtpError::ConnectionError)?
-                .ip(),
-        };
+        let ip = self
+            .reader
+            .get_ref()
+            .get_ref()
+            .local_addr()
+            .map_err(FtpError::ConnectionError)?
+            .ip();
 
         debug!("Active mode, listening on {}:{}", ip, addr.port());
 
@@ -1115,17 +1110,6 @@ where
         })
     }
 
-    /// guard against multiple data connections
-    ///
-    /// If `data_connection_open` is true, returns an [`FtpError::DataConnectionAlreadyOpen`] indicating that a data connection is already open.
-    /// Otherwise, returns Ok(()).
-    fn guard_multiple_data_connections(&self) -> FtpResult<()> {
-        if self.data_connection_open {
-            Err(FtpError::DataConnectionAlreadyOpen)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1470,38 +1454,26 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_should_prevent_multiple_data_connections() {
+    async fn test_data_connection_released_on_stream_drop() {
         let (mut stream, _container) = setup_stream().await;
-        let command = "LIST";
 
-        let _data_stream = stream
-            .custom_data_command(command, &[Status::AboutToSend])
+        let (_, data_stream) = stream
+            .custom_data_command("LIST", &[Status::AboutToSend])
             .await
-            .expect("Failed to perform custom data command");
-        // Try to open another data connection without closing the previous one
-        match stream
-            .custom_data_command(command, &[Status::AboutToSend])
+            .expect("first data connection");
+
+        // Drop without finalizing — permit must be released via RAII
+        drop(data_stream);
+
+        // Second connection must succeed (would hang forever or error before this fix)
+        let (_, data_stream2) = stream
+            .custom_data_command("LIST", &[Status::AboutToSend])
             .await
-        {
-            Err(FtpError::DataConnectionAlreadyOpen) => {}
-            _ => panic!("Expected DataConnectionAlreadyOpen error"),
-        }
-
-        // try with all other data commands
-        match stream.retr_as_stream("somefile.txt").await {
-            Err(FtpError::DataConnectionAlreadyOpen) => {}
-            _ => panic!("Expected DataConnectionAlreadyOpen error"),
-        }
-
-        match stream.put_with_stream("somefile.txt").await {
-            Err(FtpError::DataConnectionAlreadyOpen) => {}
-            _ => panic!("Expected DataConnectionAlreadyOpen error"),
-        }
-
-        match stream.append_with_stream("somefile.txt").await {
-            Err(FtpError::DataConnectionAlreadyOpen) => {}
-            _ => panic!("Expected DataConnectionAlreadyOpen error"),
-        }
+            .expect("second data connection should succeed after drop");
+        stream
+            .close_data_connection(BufReader::new(data_stream2))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

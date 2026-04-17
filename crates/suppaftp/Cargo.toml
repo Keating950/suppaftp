@@ -43,6 +43,7 @@ tokio = { version = "1", features = [
   "io-util",
   "net",
   "rt",
+  "sync",
   "time",
 ], optional = true }
 tokio-rustls-crate = { package = "tokio-rustls", version = "0.26", optional = true, default-features = false, features = [

@@ -10,17 +10,52 @@ use tokio::io::Result;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "tokio")]
 use tokio::net::TcpStream;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::TokioTlsStream;
 
-/// Data Stream used for communications. It can be both of type Tcp in case of plain communication or Ssl in case of FTPS
-#[pin_project(project = DataStreamProj)]
-pub enum DataStream<T>
+#[pin_project(project = DataStreamInnerProj)]
+enum DataStreamInner<T>
 where
     T: TokioTlsStream + Send,
 {
     Tcp(#[pin] TcpStream),
     Ssl(#[pin] Box<T>),
+}
+
+/// Data Stream used for communications. It can be both of type Tcp in case of plain communication or Ssl in case of FTPS
+#[pin_project]
+pub struct DataStream<T>
+where
+    T: TokioTlsStream + Send,
+{
+    #[pin]
+    inner: DataStreamInner<T>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<T> DataStream<T>
+where
+    T: TokioTlsStream + Send,
+{
+    pub(super) fn from_tcp(stream: TcpStream) -> Self {
+        DataStream {
+            inner: DataStreamInner::Tcp(stream),
+            permit: None,
+        }
+    }
+
+    pub(super) fn from_ssl(stream: Box<T>) -> Self {
+        DataStream {
+            inner: DataStreamInner::Ssl(stream),
+            permit: None,
+        }
+    }
+
+    pub(super) fn with_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self.permit = Some(permit);
+        self
+    }
 }
 
 #[cfg(feature = "async-secure")]
@@ -30,9 +65,9 @@ where
 {
     /// Unwrap the stream into TcpStream. This method is only used in secure connection.
     pub fn into_tcp_stream(self) -> TcpStream {
-        match self {
-            DataStream::Tcp(stream) => stream,
-            DataStream::Ssl(stream) => stream.tcp_stream(),
+        match self.inner {
+            DataStreamInner::Tcp(stream) => stream,
+            DataStreamInner::Ssl(stream) => stream.tcp_stream(),
         }
     }
 }
@@ -43,9 +78,9 @@ where
 {
     /// Returns a reference to the underlying TcpStream.
     pub fn get_ref(&self) -> &TcpStream {
-        match self {
-            DataStream::Tcp(stream) => stream,
-            DataStream::Ssl(stream) => stream.get_ref(),
+        match &self.inner {
+            DataStreamInner::Tcp(stream) => stream,
+            DataStreamInner::Ssl(stream) => stream.get_ref(),
         }
     }
 }
@@ -61,9 +96,9 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<Result<()>> {
-        match self.project() {
-            DataStreamProj::Tcp(stream) => stream.poll_read(cx, buf),
-            DataStreamProj::Ssl(stream) => stream.poll_read(cx, buf),
+        match self.project().inner.project() {
+            DataStreamInnerProj::Tcp(stream) => stream.poll_read(cx, buf),
+            DataStreamInnerProj::Ssl(stream) => stream.poll_read(cx, buf),
         }
     }
 }
@@ -77,9 +112,9 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize>> {
-        match self.project() {
-            DataStreamProj::Tcp(stream) => stream.poll_write(cx, buf),
-            DataStreamProj::Ssl(stream) => stream.poll_write(cx, buf),
+        match self.project().inner.project() {
+            DataStreamInnerProj::Tcp(stream) => stream.poll_write(cx, buf),
+            DataStreamInnerProj::Ssl(stream) => stream.poll_write(cx, buf),
         }
     }
 
@@ -87,9 +122,9 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<()>> {
-        match self.project() {
-            DataStreamProj::Tcp(stream) => stream.poll_flush(cx),
-            DataStreamProj::Ssl(stream) => stream.poll_flush(cx),
+        match self.project().inner.project() {
+            DataStreamInnerProj::Tcp(stream) => stream.poll_flush(cx),
+            DataStreamInnerProj::Ssl(stream) => stream.poll_flush(cx),
         }
     }
 
@@ -97,9 +132,9 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<()>> {
-        match self.project() {
-            DataStreamProj::Tcp(stream) => stream.poll_shutdown(cx),
-            DataStreamProj::Ssl(stream) => stream.poll_shutdown(cx),
+        match self.project().inner.project() {
+            DataStreamInnerProj::Tcp(stream) => stream.poll_shutdown(cx),
+            DataStreamInnerProj::Ssl(stream) => stream.poll_shutdown(cx),
         }
     }
 }
